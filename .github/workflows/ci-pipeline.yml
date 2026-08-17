@@ -1,0 +1,150 @@
+name: my-first-workflow
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKENS:
+        required: true
+
+jobs:
+  unit-tests:
+    name: Running Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.10'
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Unit Tests
+        run: |
+          mkdir reports/
+          pytest -v --junitxml=reports/unit-test-results.xml --cov=. --cov-report=xml:reports/coverage.xml --cov-report=term-missing -v
+      - name: Upload code coverage report
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: unit-test-report
+          path: reports/
+  codeQl:
+    name: CodeQL Secrity Scan
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      matrix:
+        language: ['python']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+      - name: Perform Codeql Analysis
+        uses:  github/codeql-action/analyze@v4
+        with:
+          category: "security"
+  sonarqube:
+    name: SonarQube
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Download Coverage reports
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: unit-test-report
+          path: reports/
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Sonar Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  Docker:
+    name: Build_Image
+    runs-on: ubuntu-latest
+    needs: [codeQl,sonarqube]
+    if: success()
+    outputs:
+      image-tags: ${{ steps.vars.outputs.IMAGE_TAGS }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3.0.0
+
+      - name: Generate Image Tags
+        id: vars
+        run : |
+          IMAGE_TAGS="${{ github.run_id }}-${GITHUB_SHA::7}"
+          echo "IMAGE_TAGS=$IMAGE_TAGS" >> $GITHUB_OUTPUT
+
+      - name: Build Image (no push)
+        uses: docker/build-push-action@v5.0.0
+
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: akshayputtaswamy:${{ steps.vars.outputs.IMAGE_TAGS }}
+          load: true
+
+      - name: Save Docker Image
+        run: docker save akshayputtaswamy:${{ steps.vars.outputs.IMAGE_TAGS }} -o test_app_image.tar
+
+      - name: Upload Docker Image Artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: test_app_image
+          path: test_app_image.tar
+
+  Docker_Publish:
+    name: Publish Image to DockerHub
+    runs-on: ubuntu-latest
+    needs: Docker
+    steps:
+      - name: Download Image
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: test_app_image
+          path: .
+
+      - name: Load Docker Image
+        run: docker load -i  test_app_image.tar
+
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKENS}}
+
+      - name: Tag Image
+        run: |
+          IMAGE_TAG=${{ needs.Docker.outputs.image-tags }}
+          docker image tag akshayputtaswamy:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/test_app_image:$IMAGE_TAG
+
+      - name: Docker Image Push
+        run: |
+          IMAGE_TAG=${{ needs.Docker.outputs.image-tags }}
+          docker image push ${{ secrets.DOCKERHUB_USERNAME }}/test_app_image:$IMAGE_TAG
+          
+          
+          
+          
